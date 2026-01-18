@@ -1,0 +1,323 @@
+# Ensemble (ResNet50 + DenseNet121 + EfficientNetB0)
+import os, math, numpy as np
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models, datasets, transforms
+from torch.utils.data import DataLoader
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    confusion_matrix, mean_absolute_error, mean_squared_error, classification_report
+)
+
+# CONFIG
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+data_dir = "/content/drive/MyDrive/tomato_dataset/tomato"
+train_dir = os.path.join(data_dir, "train")
+val_dir = os.path.join(data_dir, "val")
+
+batch_size = 32
+num_epochs = 5
+num_workers = 4
+lr = 1e-3            # heads lr (backbones frozen by default)
+freeze_backbones = True   # set False to fine-tune entire ensemble (slower)
+save_path = "best_ensemble_heads.pth"
+
+# sanity
+assert os.path.isdir(train_dir), f"Train dir not found: {train_dir}"
+assert os.path.isdir(val_dir), f"Val dir not found: {val_dir}"
+
+# DATA
+train_transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(0.2,0.2,0.2),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+val_transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+train_ds = datasets.ImageFolder(train_dir, transform=train_transform)
+val_ds   = datasets.ImageFolder(val_dir, transform=val_transform)
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+num_classes = len(train_ds.classes)
+print(f"Detected classes ({num_classes}): {train_ds.classes}")
+
+# UTILS: load pretrained robustly across torchvision versions
+
+def try_load_model(fn):
+    """Call fn() and fall back between weight API variants."""
+    try:
+        return fn(pretrained=True)
+    except TypeError:
+        # newer torchvision uses weights=...
+        try:
+            return fn(weights=fn.__name__.upper() + "_WEIGHTS")
+        except Exception:
+            # last fallback: call without args
+            return fn()
+
+# BUILD BACKBONES (feature extractors) + small heads
+# We'll keep simple feature extractors and small linear heads.
+# ResNet50 -> 2048, DenseNet121 -> 1024, EfficientNetB0 -> 1280
+
+# Load backbones (pretrained) and convert to feature extractors
+# Use try/except for weight arg compatibility
+try:
+    res50 = models.resnet50(pretrained=True)
+except Exception:
+    res50 = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+
+# feature extractor: everything except the final fc
+resnet_feats = nn.Sequential(*list(res50.children())[:-1])   # output shape: [B,2048,1,1]
+
+try:
+    d121 = models.densenet121(pretrained=True)
+except Exception:
+    d121 = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+
+# DenseNet's .features outputs [B,1024,H,W]
+densenet_feats = d121.features
+
+try:
+    e0 = models.efficientnet_b0(pretrained=True)
+except Exception:
+    e0 = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+
+# EfficientNet's children except classifier: use features + pool later
+efficientnet_feats = nn.Sequential(*list(e0.children())[:-1])  # typically ends with conv head, then pooling we will add
+
+# move to device
+resnet_feats = resnet_feats.to(device)
+densenet_feats = densenet_feats.to(device)
+efficientnet_feats = efficientnet_feats.to(device)
+
+# Freeze backbones if requested (speeds up training)
+if freeze_backbones:
+    for p in resnet_feats.parameters():
+        p.requires_grad = False
+    for p in densenet_feats.parameters():
+        p.requires_grad = False
+    for p in efficientnet_feats.parameters():
+        p.requires_grad = False
+
+# create pooling layers and linear heads (trainable)
+class EnsembleHeads(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        # adaptive pools
+        self.pool_res = nn.AdaptiveAvgPool2d((1,1))   # for resnet
+        self.pool_den = nn.AdaptiveAvgPool2d((1,1))   # for densenet
+        self.pool_eff = nn.AdaptiveAvgPool2d((1,1))   # for efficient
+
+        # heads
+        self.head_res = nn.Linear(2048, num_classes)
+        self.head_den = nn.Linear(1024, num_classes)
+        self.head_eff = nn.Linear(1280, num_classes)
+
+    def forward(self, r_feat, d_feat, e_feat):
+        # r_feat: [B,2048,1,1]  -> flatten
+        r = self.pool_res(r_feat).view(r_feat.size(0), -1)
+        d = self.pool_den(d_feat).view(d_feat.size(0), -1)
+        e = self.pool_eff(e_feat).view(e_feat.size(0), -1)
+
+        logits_r = self.head_res(r)
+        logits_d = self.head_den(d)
+        logits_e = self.head_eff(e)
+
+        # Average logits (equivalent to ensembling before softmax)
+        logits = (logits_r + logits_d + logits_e) / 3.0
+        return logits, (logits_r, logits_d, logits_e)
+
+heads = EnsembleHeads(num_classes).to(device)
+
+# Collect parameters to optimize: only heads (and optionally backbones if freeze_backbones==False)
+params = list(heads.parameters())
+if not freeze_backbones:
+    params += list(resnet_feats.parameters()) + list(densenet_feats.parameters()) + list(efficientnet_feats.parameters())
+
+optimizer = optim.Adam(params, lr=lr)
+criterion = nn.CrossEntropyLoss()
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+
+# TRAIN / VAL LOOP
+best_val_acc = 0.0
+for epoch in range(1, num_epochs+1):
+    # TRAIN
+    heads.train()
+    if not freeze_backbones:
+        resnet_feats.train(); densenet_feats.train(); efficientnet_feats.train()
+    else:
+        resnet_feats.eval(); densenet_feats.eval(); efficientnet_feats.eval()
+
+    running_loss = 0.0
+    running_correct = 0
+    running_total = 0
+
+    pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}/{num_epochs}", leave=False)
+    for images, labels in pbar:
+        images = images.to(device); labels = labels.to(device)
+        optimizer.zero_grad()
+
+        # forward through backbones
+        with torch.set_grad_enabled(not freeze_backbones):
+            r_out = resnet_feats(images)                 # [B,2048,1,1]
+            d_out = densenet_feats(images)               # [B,1024,H,W]
+            e_out = efficientnet_feats(images)           # shape may vary but pool will handle
+
+        logits, _ = heads(r_out, d_out, e_out)          # [B, num_classes]
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        preds = logits.argmax(dim=1)
+        running_correct += (preds == labels).sum().item()
+        running_total += images.size(0)
+        pbar.set_postfix_str(f"loss={(running_loss/running_total):.4f} acc={(running_correct/running_total*100):.2f}%")
+
+    train_loss = running_loss / running_total
+    train_acc = running_correct / running_total
+
+    # VALIDATION
+    heads.eval()
+    resnet_feats.eval(); densenet_feats.eval(); efficientnet_feats.eval()
+    val_loss = 0.0
+    val_correct = 0
+    val_total = 0
+    y_true = []
+    y_pred = []
+
+    with torch.no_grad():
+        for images, labels in tqdm(val_loader, desc="Validate", leave=False):
+            images = images.to(device); labels = labels.to(device)
+            r_out = resnet_feats(images)
+            d_out = densenet_feats(images)
+            e_out = efficientnet_feats(images)
+            logits, _ = heads(r_out, d_out, e_out)
+
+            loss = criterion(logits, labels)
+            val_loss += loss.item() * images.size(0)
+
+            preds = logits.argmax(dim=1)
+            val_correct += (preds == labels).sum().item()
+            val_total += images.size(0)
+
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+
+    val_loss = val_loss / val_total
+    val_acc = val_correct / val_total
+    scheduler.step(val_loss)
+
+    print(f"Epoch {epoch}: Train Loss {train_loss:.4f} Train Acc {train_acc*100:.2f}% | Val Loss {val_loss:.4f} Val Acc {val_acc*100:.2f}%")
+
+    # save best
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save({
+            'heads_state': heads.state_dict(),
+            'resnet_state': resnet_feats.state_dict(),
+            'densenet_state': densenet_feats.state_dict(),
+            'efficient_state': efficientnet_feats.state_dict(),
+            'optimizer': optimizer.state_dict()
+        }, save_path)
+
+# EVALUATION METRICS (on last validation preds)
+y_true = np.array(y_true)
+y_pred = np.array(y_pred)
+acc = accuracy_score(y_true, y_pred)
+f1 = f1_score(y_true, y_pred, average='weighted')
+prec = precision_score(y_true, y_pred, average='weighted')
+recall = recall_score(y_true, y_pred, average='weighted')
+
+cm = confusion_matrix(y_true, y_pred)
+# per-class specificity: TN/(TN+FP)
+specificities = []
+for i in range(cm.shape[0]):
+    TP = cm[i,i]
+    FP = cm[:,i].sum() - TP
+    FN = cm[i,:].sum() - TP
+    TN = cm.sum() - (TP + FP + FN)
+    spec = TN / (TN + FP + 1e-8)
+    specificities.append(spec)
+specificity = np.mean(specificities)
+
+mae = mean_absolute_error(y_true, y_pred)
+mse = mean_squared_error(y_true, y_pred)
+rmse = math.sqrt(mse)
+
+print("\n==== Final Validation Metrics ====")
+print(f"Accuracy : {acc*100:.2f}%")
+print(f"F1 score : {f1:.4f}")
+print(f"Precision: {prec:.4f}")
+print(f"Sensitivity (Recall): {recall:.4f}")
+print(f"Specificity (avg): {specificity:.4f}")
+print(f"MAE: {mae:.4f}  MSE: {mse:.4f}  RMSE: {rmse:.4f}\n")
+print("Classification Report:\n", classification_report(y_true, y_pred, target_names=train_ds.classes))
+
+# ALL PLOTS 
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import ConfusionMatrixDisplay, precision_recall_fscore_support, roc_curve, auc
+from sklearn.preprocessing import label_binarize
+
+# CONFUSION MATRIX 
+plt.figure(figsize=(10,8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='YlGnBu',
+            xticklabels=train_ds.classes, yticklabels=train_ds.classes)
+plt.title("Confusion Matrix of Ensemble Model")
+plt.xlabel("Predicted Labels")
+plt.ylabel("True Labels")
+plt.show()
+
+# PER-CLASS PRECISION, RECALL, F1 BAR PLOT
+precisions, recalls, f1s, _ = precision_recall_fscore_support(y_true, y_pred, average=None)
+
+x = np.arange(len(train_ds.classes))
+width = 0.25
+plt.figure(figsize=(12,6))
+plt.bar(x - width, precisions, width, label='Precision')
+plt.bar(x, recalls, width, label='Recall')
+plt.bar(x + width, f1s, width, label='F1 Score')
+plt.xticks(x, train_ds.classes, rotation=45)
+plt.title("Per-Class Precision, Recall, and F1 Scores")
+plt.ylabel("Score")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ACCURACY PER CLASS
+class_acc = cm.diagonal() / cm.sum(axis=1)
+plt.figure(figsize=(10,5))
+sns.barplot(x=train_ds.classes, y=class_acc)
+plt.title("Accuracy per Class")
+plt.ylabel("Accuracy")
+plt.xticks(rotation=45)
+plt.ylim(0,1)
+plt.show()
+
+# ROC CURVES (multiclass)
+# Works if num_classes > 2
+if num_classes > 2:
+    y_true_bin = label_binarize(y_true, classes=np.arange(num_classes))
+    y_pred_bin = label_binarize(y_pred, classes=np.arange(num_classes))
+    plt.figure(figsize=(8,6))
+    for i, class_name in enumerate(train_ds.classes):
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred_bin[:, i])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, label=f"{class_name} (AUC={roc_auc:.2f})")
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.title("ROC Curves (One-vs-Rest)")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend()
+    plt.show()
